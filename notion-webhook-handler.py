@@ -41,22 +41,33 @@ def _extract_company_info(notion_page_payload: dict) -> tuple[str | None, str | 
     return company_name, website
 
 
-def _notion_update_description_by_agent(page_id: str, text: str) -> None:
+def _truncate_jp_150(text: str) -> str:
+    """ざっくり「150文字以下」を担保（Unicodeの文字数ベース）"""
+    text = (text or "").strip()
+    if len(text) <= 150:
+        return text
+    return text[:150].rstrip() + "…"
+
+
+def _notion_update_overview_and_description(page_id: str, overview: str, description: str) -> None:
     if not NOTION_API_KEY:
         raise RuntimeError("NOTION_API_KEY is not set")
 
-    text = (text or "").strip()
-    if len(text) > 1800:
-        text = text[:1800] + "…"
+    overview = _truncate_jp_150(overview)
+
+    description = (description or "").strip()
+    if len(description) > 1800:
+        description = description[:1800] + "…"
 
     url = f"https://api.notion.com/v1/pages/{page_id}"
     payload = {
         "properties": {
+            "Overview": {
+                "rich_text": [{"type": "text", "text": {"content": overview}}]
+            },
             "Description by Agent": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": text}}
-                ]
-            }
+                "rich_text": [{"type": "text", "text": {"content": description}}]
+            },
         }
     }
 
@@ -73,11 +84,12 @@ def _notion_update_description_by_agent(page_id: str, text: str) -> None:
 
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            _ = resp.read().decode("utf-8")
+            _ = resp.read().decode("utf-8", errors="replace")
             print("Notion update status:", resp.status)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        print("Notion HTTPError:", e.code, body)
+        print("Notion HTTPError:", e.code)
+        print("Notion HTTPError body:", body)
         raise
 
 
@@ -107,23 +119,41 @@ def lambda_handler(event, context):
         print("company_name:", company_name)
         print("website:", website)
 
-        # ---- OpenAI web search + summarize ----
-        # web_search を有効化すると、モデルが必要に応じてWeb検索して要約を生成できます :contentReference[oaicite:2]{index=2}
+        # ---- OpenAI web search + summarize (2粒度を一括生成) ----
         prompt = f"""
-あなたは企業調査アナリストです。
-次の企業について、最新のWeb情報を検索して事業内容を日本語で簡潔に要約してください。
+あなたは企業調査アナリストである。最新のWeb情報を検索して、次の企業の事業内容を要約せよ。
 
 - 企業名: {company_name or "(不明)"}
 - Website: {website or "(不明)"}
 
-出力フォーマット:
+### 調査情報源の指示（最重要）
+1. 一次情報としてのホームページ（URL）の情報を核とする。
+2. それに加え、客観的かつ広範な情報を収集するため、少なくとも５つ以上の信頼できる外部情報源
+   （TechCrunch, Bloomberg, Crunchbase, 公式プレスリリース等）を調査し、情報を統合する。
+3. 情報鮮度を重視し、直近3年以内の情報を優先して利用すること。
+4. 特に、技術的な特徴や市場での評価については、第三者による客観的な見解を優先して分析に含めること。
+
+出力は「必ず」JSONのみ（前後に説明文を付けない）で返せ。
+JSONスキーマ:
+{{
+  "overview": "150文字以下の日本語で、企業の事業内容を一文で要約せよ。",
+  "description": "日本語で詳細要約せよ。文体は必ず『だ・である』調とする。
 - 事業概要（2〜4文）
 - 主な提供価値/顧客（箇条書き 2〜4個）
 - 補足（あれば：資金調達/主要プロダクト/対象市場など 1〜2行）
+- 出典（以下の表記ルールに従い、最後にまとめて記載せよ）
+"
+}}
+
+### 出典表記ルール
+- 出典は description の最後にまとめて記載すること。
+- 表記形式は以下を厳守せよ。
+  「サイト名＋記事タイトル（年）＋(URL)」
+- 複数ある場合は箇条書きで列挙すること。
 
 注意:
-- 不確かな情報は「可能性がある」など断定を避ける
-- Website がある場合はまずそれを起点に企業を特定する
+- 不確かな情報は断定せず「可能性がある」などで表現すること。
+- Website がある場合はまずそれを起点に企業を特定せよ。
 """.strip()
 
         print("calling OpenAI (web_search)...")
@@ -132,11 +162,28 @@ def lambda_handler(event, context):
             tools=[{"type": "web_search"}],
             input=prompt,
         )
-        summary = response.output_text  # web_search 使用時もここに最終テキストが入ります :contentReference[oaicite:3]{index=3}
-        print("OpenAI done. summary length:", len(summary))
 
-        # ---- Write to Notion ----
-        _notion_update_description_by_agent(page_id, summary)
+        raw = (response.output_text or "").strip()
+        print("OpenAI done. raw length:", len(raw))
+
+        # JSONパース（失敗したらそのままdescriptionに入れてoverviewは空にする）
+        overview = ""
+        description = ""
+        try:
+            obj = json.loads(raw)
+            overview = obj.get("overview") or ""
+            description = obj.get("description") or ""
+        except Exception:
+            print("WARNING: OpenAI output was not valid JSON. Falling back.")
+            overview = ""
+            description = raw
+
+        # 保険：overviewが空ならdescriptionから雑に作る
+        if not overview:
+            overview = _truncate_jp_150(description.replace("\n", " "))
+
+        # ---- Write to Notion (2カラム同時更新) ----
+        _notion_update_overview_and_description(page_id, overview, description)
         print("Notion update done")
 
         return {
