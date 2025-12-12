@@ -49,7 +49,22 @@ def _truncate_jp_150(text: str) -> str:
     return text[:150].rstrip() + "…"
 
 
-def _notion_update_overview_and_description(page_id: str, overview: str, description: str) -> None:
+def _clean_hq(text: str) -> str:
+    """
+    HQは短い文字列想定。空・不正なら「不明」。
+    形式の厳密な正規化はモデルに任せつつ、最低限の安全策だけ入れる。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "不明"
+    if len(t) > 60:
+        t = t[:60].rstrip() + "…"
+    if t in ["不詳", "不明。", "不明です", "Unknown", "N/A", "NA", "-"]:
+        return "不明"
+    return t
+
+
+def _notion_update_overview_description_hq(page_id: str, overview: str, description: str, hq: str) -> None:
     if not NOTION_API_KEY:
         raise RuntimeError("NOTION_API_KEY is not set")
 
@@ -59,6 +74,8 @@ def _notion_update_overview_and_description(page_id: str, overview: str, descrip
     if len(description) > 1800:
         description = description[:1800] + "…"
 
+    hq = _clean_hq(hq)
+
     url = f"https://api.notion.com/v1/pages/{page_id}"
     payload = {
         "properties": {
@@ -67,6 +84,9 @@ def _notion_update_overview_and_description(page_id: str, overview: str, descrip
             },
             "Description by Agent": {
                 "rich_text": [{"type": "text", "text": {"content": description}}]
+            },
+            "HQ": {
+                "rich_text": [{"type": "text", "text": {"content": hq}}]
             },
         }
     }
@@ -119,9 +139,9 @@ def lambda_handler(event, context):
         print("company_name:", company_name)
         print("website:", website)
 
-        # ---- OpenAI web search + summarize (2粒度を一括生成) ----
+        # ---- OpenAI web search + summarize (overview/description/HQ を一括生成) ----
         prompt = f"""
-あなたは企業調査アナリストである。最新のWeb情報を検索して、次の企業の事業内容を要約せよ。
+あなたは企業調査アナリストである。最新のWeb情報を検索して、次の企業の事業内容と本社所在地（HQ）を特定し要約せよ。
 
 - 企業名: {company_name or "(不明)"}
 - Website: {website or "(不明)"}
@@ -133,14 +153,23 @@ def lambda_handler(event, context):
 3. 情報鮮度を重視し、直近3年以内の情報を優先して利用すること。
 4. 特に、技術的な特徴や市場での評価については、第三者による客観的な見解を優先して分析に含めること。
 
+### HQ（本社所在地）の指示（重要）
+- 複数のサイトを調査して本社所在地を特定せよ（一次情報＋第三者情報を照合すること）。
+- 本社所在地が一つに絞ることができない／情報が矛盾する／確証が持てない場合は「不明」と出力せよ。
+- HQの出力形式は次に厳密に従え：
+  - 日本の場合：都道府県名のみ（例：愛知、東京）
+  - 米国の場合：市名, 州略称（例：San Francisco, CA）
+  - その他の場合：国名のみ（例：Germany）
+
 出力は「必ず」JSONのみ（前後に説明文を付けない）で返せ。
 JSONスキーマ:
 {{
   "overview": "150文字以下の日本語で、企業の事業内容を一文で要約せよ。",
-  "description": "日本語で詳細要約せよ。文体は必ず『だ・である』調とする。
-- 事業概要（2〜4文）
-- 主な提供価値/顧客（箇条書き 2〜4個）
-- 補足（あれば：資金調達/主要プロダクト/対象市場など 1〜2行）
+  "hq": "上記のHQ出力形式に従う本社所在地。確証がなければ「不明」。",
+  "description": "日本語で詳細要約せよ。文体は必ず『だ・である』調とする。形式は以下：
+- 事業概要（必ず2〜4文で記述すること）
+- 主な提供価値/顧客（必ず箇条書きで2〜4個）
+- 技術的コアコンピタンス（独自のアルゴリズム、特許技術、利用しているAI技術〔例：LLM、CV〕など、具体的な技術的優位性に焦点を当てて記述せよ）
 - 出典（以下の表記ルールに従い、最後にまとめて記載せよ）
 "
 }}
@@ -158,7 +187,7 @@ JSONスキーマ:
 
         print("calling OpenAI (web_search)...")
         response = client.responses.create(
-            model="gpt-5",
+            model="gpt-5-nano",
             tools=[{"type": "web_search"}],
             input=prompt,
         )
@@ -166,24 +195,29 @@ JSONスキーマ:
         raw = (response.output_text or "").strip()
         print("OpenAI done. raw length:", len(raw))
 
-        # JSONパース（失敗したらそのままdescriptionに入れてoverviewは空にする）
+        # JSONパース（失敗したらフォールバック）
         overview = ""
         description = ""
+        hq = "不明"
         try:
             obj = json.loads(raw)
             overview = obj.get("overview") or ""
             description = obj.get("description") or ""
+            hq = obj.get("hq") or "不明"
         except Exception:
             print("WARNING: OpenAI output was not valid JSON. Falling back.")
             overview = ""
             description = raw
+            hq = "不明"
 
         # 保険：overviewが空ならdescriptionから雑に作る
         if not overview:
             overview = _truncate_jp_150(description.replace("\n", " "))
 
-        # ---- Write to Notion (2カラム同時更新) ----
-        _notion_update_overview_and_description(page_id, overview, description)
+        hq = _clean_hq(hq)
+
+        # ---- Write to Notion (3カラム同時更新) ----
+        _notion_update_overview_description_hq(page_id, overview, description, hq)
         print("Notion update done")
 
         return {
